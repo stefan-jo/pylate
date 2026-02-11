@@ -477,6 +477,8 @@ class ColBERT(SentenceTransformer):
         is_query: bool = True,
         pool_factor: int = 1,
         protected_tokens: int = 1,
+        pool_method: Literal["hierarchical", "span", "kmeans"] = "hierarchical",
+        use_triton: bool | None = None,
     ) -> list[torch.Tensor] | ndarray | torch.Tensor:
         """
         Computes sentence embeddings.
@@ -524,6 +526,12 @@ class ColBERT(SentenceTransformer):
             to 1, no pooling is done; if set to 2, 50% of the tokens are kept; if set to 3, 33%, and so on. Defaults to 1.
         protected_tokens
             The number of tokens at the beginning of the sequence that should not be pooled. Defaults to 1 (CLS token).
+        pool_method
+            Pooling strategy to apply when encoding documents with ``pool_factor > 1``. Supported values are
+            ``"hierarchical"``, ``"span"``, and ``"kmeans"``. Defaults to ``"hierarchical"``.
+        use_triton
+            Whether to use the Triton backend for k-means pooling when ``pool_method="kmeans"``.
+            If ``None``, fastkmeans auto-detects (enabled on modern GPUs). Defaults to ``None``.
 
         """
         if isinstance(sentences, list):
@@ -547,6 +555,8 @@ class ColBERT(SentenceTransformer):
                         is_query=is_query,
                         pool_factor=pool_factor,
                         protected_tokens=protected_tokens,
+                        pool_method=pool_method,
+                        use_triton=use_triton,
                     )
 
                     batch_embeddings = (
@@ -723,10 +733,12 @@ class ColBERT(SentenceTransformer):
 
                 # Pool factor must be greater than 1: keeping 1 over pool_factor tokens embeddings.
                 if pool_factor > 1 and not is_query:
-                    embeddings = self.pool_embeddings_hierarchical(
+                    embeddings = self._pool_document_embeddings(
                         documents_embeddings=embeddings,
                         pool_factor=pool_factor,
                         protected_tokens=protected_tokens,
+                        pool_method=pool_method,
+                        use_triton=use_triton,
                     )
 
                 # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
@@ -772,6 +784,38 @@ class ColBERT(SentenceTransformer):
 
         return all_embeddings[0] if input_was_string else all_embeddings
 
+    def _pool_document_embeddings(
+        self,
+        documents_embeddings: list[torch.Tensor],
+        pool_factor: int = 1,
+        protected_tokens: int = 1,
+        pool_method: Literal["hierarchical", "span", "kmeans"] = "hierarchical",
+        use_triton: bool | None = None,
+    ) -> list[torch.Tensor]:
+        pool_method = pool_method.lower()
+        pooling_functions = {
+            "hierarchical": self.pool_embeddings_hierarchical,
+            "span": self.pool_embeddings_span,
+            "kmeans": self.pool_embeddings_kmeans,
+        }
+
+        try:
+            pooling_function = pooling_functions[pool_method]
+        except KeyError as error:
+            valid_methods = ", ".join(pooling_functions.keys())
+            raise ValueError(
+                f"Invalid pool_method: {pool_method!r}. Expected one of: {valid_methods}."
+            ) from error
+
+        pool_kwargs: dict = {
+            "documents_embeddings": documents_embeddings,
+            "pool_factor": pool_factor,
+            "protected_tokens": protected_tokens,
+        }
+        if pool_method == "kmeans":
+            pool_kwargs["use_triton"] = use_triton
+        return pooling_function(**pool_kwargs)
+
     def pool_embeddings_hierarchical(
         self,
         documents_embeddings: list[torch.Tensor],
@@ -794,15 +838,21 @@ class ColBERT(SentenceTransformer):
         -------
             A list of pooled embeddings for each document.
         """
-        device = torch.device(device="cuda" if torch.cuda.is_available() else "cpu")
         pooled_embeddings = []
 
         for document_embeddings in documents_embeddings:
-            document_embeddings = document_embeddings.to(device=device)
-
             # Separate protected tokens from the rest
             protected_embeddings = document_embeddings[:protected_tokens]
             embeddings_to_pool = document_embeddings[protected_tokens:]
+            num_embeddings = len(embeddings_to_pool)
+
+            if num_embeddings <= 1:
+                pooled_document_embeddings = (
+                    [embeddings_to_pool[0]] if num_embeddings == 1 else []
+                )
+                pooled_document_embeddings.extend(protected_embeddings)
+                pooled_embeddings.append(torch.stack(tensors=pooled_document_embeddings))
+                continue
 
             # Compute cosine similarity and convert to distance matrix
             cosine_similarities = torch.mm(
@@ -812,7 +862,6 @@ class ColBERT(SentenceTransformer):
 
             # Perform hierarchical clustering using Ward's method
             clusters = hierarchy.linkage(distance_matrix, method="ward")
-            num_embeddings = len(embeddings_to_pool)
 
             # Determine the number of clusters based on pool_factor
             num_clusters = max(num_embeddings // pool_factor, 1)
@@ -825,7 +874,8 @@ class ColBERT(SentenceTransformer):
             for cluster_id in range(1, num_clusters + 1):
                 cluster_indices = torch.where(
                     condition=torch.tensor(
-                        data=cluster_labels == cluster_id, device=device
+                        data=cluster_labels == cluster_id,
+                        device=embeddings_to_pool.device,
                     )
                 )[0]
                 if cluster_indices.numel() > 0:
@@ -833,6 +883,122 @@ class ColBERT(SentenceTransformer):
                     pooled_document_embeddings.append(cluster_embedding)
 
             # Re-append protected embeddings
+            pooled_document_embeddings.extend(protected_embeddings)
+            pooled_embeddings.append(torch.stack(tensors=pooled_document_embeddings))
+
+        return pooled_embeddings
+
+    def pool_embeddings_span(
+        self,
+        documents_embeddings: list[torch.Tensor],
+        pool_factor: int = 1,
+        protected_tokens: int = 1,
+    ) -> list[torch.Tensor]:
+        """
+        Pools embeddings by averaging consecutive spans of tokens.
+
+        Parameters
+        ----------
+        documents_embeddings
+            A list of embeddings for each document.
+        pool_factor
+            Number of consecutive tokens to merge in each span. Defaults to 1.
+        protected_tokens
+            Number of tokens to protect from pooling at the start of each document. Defaults to 1.
+
+        Returns
+        -------
+            A list of pooled embeddings for each document.
+        """
+        pooled_embeddings = []
+
+        for document_embeddings in documents_embeddings:
+            protected_embeddings = document_embeddings[:protected_tokens]
+            embeddings_to_pool = document_embeddings[protected_tokens:]
+
+            pooled_document_embeddings = []
+            for start_idx in range(0, len(embeddings_to_pool), pool_factor):
+                span_embeddings = embeddings_to_pool[start_idx : start_idx + pool_factor]
+                pooled_document_embeddings.append(span_embeddings.mean(dim=0))
+
+            pooled_document_embeddings.extend(protected_embeddings)
+            pooled_embeddings.append(torch.stack(tensors=pooled_document_embeddings))
+
+        return pooled_embeddings
+
+    def pool_embeddings_kmeans(
+        self,
+        documents_embeddings: list[torch.Tensor],
+        pool_factor: int = 1,
+        protected_tokens: int = 1,
+        use_triton: bool | None = None,
+    ) -> list[torch.Tensor]:
+        """
+        Pools embeddings by k-means clustering and averaging embeddings within each cluster.
+
+        Parameters
+        ----------
+        documents_embeddings
+            A list of embeddings for each document.
+        pool_factor
+            Factor to determine the number of clusters. Defaults to 1.
+        protected_tokens
+            Number of tokens to protect from pooling at the start of each document. Defaults to 1.
+        use_triton
+            Whether to use the Triton backend for faster k-means. If ``None``, fastkmeans auto-detects.
+            Defaults to ``None``.
+
+        Returns
+        -------
+            A list of pooled embeddings for each document.
+        """
+        try:
+            import fastkmeans
+        except ImportError as error:
+            raise ImportError(
+                "pool_method='kmeans' requires the 'fastkmeans' package."
+            ) from error
+
+        pooled_embeddings = []
+
+        for document_embeddings in documents_embeddings:
+            protected_embeddings = document_embeddings[:protected_tokens]
+            embeddings_to_pool = document_embeddings[protected_tokens:]
+            num_embeddings = len(embeddings_to_pool)
+
+            if num_embeddings <= 1:
+                pooled_document_embeddings = (
+                    [embeddings_to_pool[0]] if num_embeddings == 1 else []
+                )
+                pooled_document_embeddings.extend(protected_embeddings)
+                pooled_embeddings.append(torch.stack(tensors=pooled_document_embeddings))
+                continue
+
+            num_clusters = max(num_embeddings // pool_factor, 1)
+            r = max(num_embeddings / num_clusters, 1.0)
+            niter = max(min(12 + math.ceil(6 * math.log2(max(r, 2))), 50), 20)
+            embeddings_np = embeddings_to_pool.float().cpu().numpy()
+
+            kmeans = fastkmeans.FastKMeans(
+                embeddings_to_pool.shape[-1],
+                num_clusters,
+                niter=niter,
+                gpu=embeddings_to_pool.is_cuda,
+                verbose=False,
+                seed=42,
+                use_triton=use_triton,
+            )
+            kmeans.train(embeddings_np)
+            cluster_labels = torch.from_numpy(kmeans.predict(embeddings_np)).to(
+                device=embeddings_to_pool.device, dtype=torch.long
+            )
+
+            pooled_document_embeddings = []
+            for cluster_id in range(num_clusters):
+                cluster_embeddings = embeddings_to_pool[cluster_labels == cluster_id]
+                if cluster_embeddings.numel() > 0:
+                    pooled_document_embeddings.append(cluster_embeddings.mean(dim=0))
+
             pooled_document_embeddings.extend(protected_embeddings)
             pooled_embeddings.append(torch.stack(tensors=pooled_document_embeddings))
 
@@ -920,6 +1086,8 @@ class ColBERT(SentenceTransformer):
         is_query: bool = True,
         pool_factor: int = 1,
         protected_tokens: int = 1,
+        pool_method: Literal["hierarchical", "span", "kmeans"] = "hierarchical",
+        use_triton: bool | None = None,
     ) -> list[np.ndarray]:
         """
         Encodes a list of sentences using multiple processes and GPUs via
@@ -965,6 +1133,12 @@ class ColBERT(SentenceTransformer):
             The factor by which to pool the document embeddings, resulting in 1/pool_factor of the original tokens.
         protected_tokens
             The number of tokens at the beginning of the sequence that should not be pooled. Defaults to 1 (CLS token).
+        pool_method
+            Pooling strategy to apply when encoding documents with ``pool_factor > 1``. Supported values are
+            ``"hierarchical"``, ``"span"``, and ``"kmeans"``. Defaults to ``"hierarchical"``.
+        use_triton
+            Whether to use the Triton backend for k-means pooling when ``pool_method="kmeans"``.
+            If ``None``, fastkmeans auto-detects. Defaults to ``None``.
 
         Examples
         --------
@@ -1017,6 +1191,8 @@ class ColBERT(SentenceTransformer):
                         is_query,
                         pool_factor,
                         protected_tokens,
+                        pool_method,
+                        use_triton,
                     ]
                 )
                 last_chunk_id += 1
@@ -1036,6 +1212,8 @@ class ColBERT(SentenceTransformer):
                     is_query,
                     pool_factor,
                     protected_tokens,
+                    pool_method,
+                    use_triton,
                 ]
             )
             last_chunk_id += 1
