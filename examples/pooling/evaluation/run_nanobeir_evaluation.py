@@ -69,7 +69,8 @@ def write_summary(
     pool_method: str,
     dataset_names: list[str],
     batch_size: int,
-    use_triton: bool | None = None,
+    use_triton: bool = False,
+    use_sklearn: bool = False,
 ) -> None:
     """Write a human-readable summary to a text file."""
     dataset_results, mean_results = parse_scores(scores)
@@ -79,8 +80,8 @@ def write_summary(
         f.write(f"Model:        {model_name}\n")
         f.write(f"pool_factor:  {pool_factor}\n")
         f.write(f"pool_method:  {pool_method}\n")
-        if use_triton is not None:
-            f.write(f"use_triton:   {use_triton}\n")
+        f.write(f"use_triton:   {use_triton}\n")
+        f.write(f"use_sklearn:  {use_sklearn}\n")
         f.write(f"datasets:     {', '.join(dataset_names)}\n")
         f.write(f"batch_size:   {batch_size}\n")
         f.write(f"Time:         {evaluation_time_seconds:.2f} s ({evaluation_time_seconds/60:.2f} min)\n\n")
@@ -125,6 +126,11 @@ def main() -> None:
         help="Use Triton backend for k-means pooling (faster on modern GPUs).",
     )
     parser.add_argument(
+        "--use-sklearn",
+        action="store_true",
+        help="Use sklearn KMeans backend for k-means pooling.",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=16,
@@ -158,7 +164,8 @@ def main() -> None:
         help="Device (e.g. cuda, cpu). Auto-detected if not set.",
     )
     args = parser.parse_args()
-    use_triton: bool | None = True if args.use_triton else None
+    use_triton: bool = args.use_triton
+    use_sklearn: bool = args.use_sklearn
     dataset_names = normalize_cli_list(args.datasets, lowercase=True, unique=False)
     if dataset_names is not None:
         invalid_datasets = sorted(set(dataset_names) - set(ALL_NANOBEIR_DATASETS))
@@ -200,6 +207,7 @@ def main() -> None:
             pool_factor=args.pool_factor,
             pool_method=args.pool_method,
             use_triton=use_triton,
+            use_sklearn=use_sklearn,
         )
 
     evaluator_kwargs = {
@@ -213,9 +221,12 @@ def main() -> None:
 
     print("=" * 60)
     triton_info = f", use_triton={use_triton}" if args.pool_method == "kmeans" else ""
+    sklearn_info = (
+        f", use_sklearn={use_sklearn}" if args.pool_method == "kmeans" else ""
+    )
     print(
-        "Starting evaluation on all NanoBEIR datasets "
-        f"(pool_factor={args.pool_factor}, pool_method={args.pool_method}{triton_info})"
+        "Starting NanoBEIR evaluation"
+        f"(pool_factor={args.pool_factor}, pool_method={args.pool_method}{triton_info}{sklearn_info})"
     )
     print("=" * 60)
     if torch.cuda.is_available():
@@ -248,6 +259,7 @@ def main() -> None:
         "pool_factor": args.pool_factor,
         "pool_method": args.pool_method,
         "use_triton": use_triton,
+        "use_sklearn": use_sklearn,
         "dataset_names": selected_datasets,
         "batch_size": args.batch_size,
         "evaluation_time_seconds": evaluation_time,
@@ -270,6 +282,7 @@ def main() -> None:
         selected_datasets,
         args.batch_size,
         use_triton=use_triton,
+        use_sklearn=use_sklearn,
     )
 
     dataset_results, mean_results = parse_scores(scores)

@@ -19,9 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
-import sys
-from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -31,38 +28,47 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
+from eval_shared import (
+    build_sweep_run_dir,
+    discover_sweep_result_records,
+    normalize_cli_list,
+    run_eval_subprocess,
+    safe_name,
+)
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 DEFAULT_MODEL = "mixedbread-ai/mxbai-edge-colbert-v0-32m"
-DEFAULT_POOL_FACTORS = [1, 2, 3, 4, 5, 7, 10, 15, 20]
+# DEFAULT_POOL_FACTORS = [1, 2, 3, 4, 5, 7, 10, 15, 20]
+DEFAULT_POOL_FACTORS = [1, 2, 3, 5, 7, 10, 15, 20]
 ALL_BEIR_DATASETS = [
-    "arguana",
-    "climate-fever",
-    "dbpedia-entity",
-    "fever",
-    "fiqa",
-    "hotpotqa",
-    "msmarco",
-    "nfcorpus",
-    "nq",
-    "quora",
-    "scidocs",
-    "scifact",
-    "trec-covid",
-    "webis-touche2020",
-    "cqadupstack/android",
-    "cqadupstack/english",
-    "cqadupstack/gaming",
-    "cqadupstack/gis",
-    "cqadupstack/mathematica",
-    "cqadupstack/physics",
-    "cqadupstack/programmers",
-    "cqadupstack/stats",
-    "cqadupstack/tex",
-    "cqadupstack/unix",
-    "cqadupstack/webmasters",
-    "cqadupstack/wordpress",
+#    "arguana",
+#    "climate-fever",
+#    "dbpedia-entity",
+#    "fever",
+    "fiqa",  # core 
+#    "hotpotqa",
+#    "msmarco",
+    "nfcorpus",  # core
+#    "nq",
+#    "quora",
+    "scidocs",  # core
+    "scifact",  # core
+#    "trec-covid",  # extended
+#    "webis-touche2020",  # extended
+#    "cqadupstack/android",
+#    "cqadupstack/english",
+#    "cqadupstack/gaming",
+#    "cqadupstack/gis",
+#    "cqadupstack/mathematica",
+#    "cqadupstack/physics",
+#    "cqadupstack/programmers",
+#    "cqadupstack/stats",
+#    "cqadupstack/tex",
+#    "cqadupstack/unix",
+#    "cqadupstack/webmasters",
+#    "cqadupstack/wordpress",
 ]
 METHODS = [
     ("hier", "hierarchical"),
@@ -70,36 +76,6 @@ METHODS = [
     ("slice", "span"),
 ]
 METRICS = ["ndcg@10", "mrr@10", "map@100", "recall@10", "recall@100"]
-
-
-def _safe_model_name(model_name: str) -> str:
-    return model_name.replace("/", "_")
-
-
-def _safe_dataset_name(dataset_name: str) -> str:
-    return dataset_name.replace("/", "_")
-
-
-def _normalize_dataset_names(dataset_names: list[str] | None) -> list[str] | None:
-    """Normalize dataset input from CLI (supports comma-separated tokens)."""
-    if dataset_names is None:
-        return None
-
-    normalized = []
-    for token in dataset_names:
-        for name in token.split(","):
-            clean_name = name.strip().lower()
-            if clean_name:
-                normalized.append(clean_name)
-
-    return normalized or None
-
-
-def _build_run_dir(output_root: Path) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = output_root / f"beir_pooling_sweep_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
 
 
 def _run_single_evaluation(
@@ -112,14 +88,13 @@ def _run_single_evaluation(
     dataset_name: str,
     device: str,
     no_fp16: bool,
-    use_triton: bool | None = None,
+    use_triton: bool = False,
+    use_sklearn: bool = False,
     batch_size: int = 16,
     k: int = 20,
     document_length: int = 180,
 ) -> None:
-    command = [
-        sys.executable,
-        str(eval_script),
+    cli_args = [
         "--model",
         model_name,
         "--pool-factor",
@@ -140,19 +115,17 @@ def _run_single_evaluation(
         str(document_length),
     ]
     if no_fp16:
-        command.append("--no-fp16")
+        cli_args.append("--no-fp16")
     if use_triton:
-        command.append("--use-triton")
+        cli_args.append("--use-triton")
+    if use_sklearn:
+        cli_args.append("--use-sklearn")
 
-    env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(repo_root)
-        if not existing_pythonpath
-        else f"{repo_root}:{existing_pythonpath}"
+    run_eval_subprocess(
+        eval_script=eval_script,
+        repo_root=repo_root,
+        cli_args=cli_args,
     )
-
-    subprocess.run(command, cwd=repo_root, check=True, env=env)
 
 
 def _result_json_path(
@@ -162,10 +135,10 @@ def _result_json_path(
     method_cli: str,
     dataset_name: str,
 ) -> Path:
-    safe_name = _safe_model_name(model_name=model_name)
-    safe_dataset = _safe_dataset_name(dataset_name=dataset_name)
+    model_name_safe = safe_name(value=model_name)
+    dataset_name_safe = safe_name(value=dataset_name)
     return output_dir / (
-        f"beir_{safe_name}_pool{pool_factor}_{method_cli}_ds_{safe_dataset}.json"
+        f"beir_{model_name_safe}_pool{pool_factor}_{method_cli}_ds_{dataset_name_safe}.json"
     )
 
 
@@ -337,6 +310,11 @@ def main() -> None:
         help="Pass --use-triton to each evaluation run (k-means pooling).",
     )
     parser.add_argument(
+        "--use-sklearn",
+        action="store_true",
+        help="Pass --use-sklearn to each evaluation run (k-means pooling).",
+    )
+    parser.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip runs when the expected JSON result file already exists.",
@@ -348,8 +326,9 @@ def main() -> None:
             f"Requested CUDA device {args.device!r}, but CUDA is not available."
         )
 
-    use_triton: bool | None = True if args.use_triton else None
-    dataset_names = _normalize_dataset_names(args.datasets)
+    use_triton: bool = args.use_triton
+    use_sklearn: bool = args.use_sklearn
+    dataset_names = normalize_cli_list(args.datasets, lowercase=True, unique=False)
     if dataset_names is not None:
         invalid_datasets = sorted(set(dataset_names) - set(ALL_BEIR_DATASETS))
         if invalid_datasets:
@@ -364,7 +343,11 @@ def main() -> None:
     this_file = Path(__file__).resolve()
     eval_script = this_file.with_name("run_beir_evaluation.py")
     repo_root = this_file.parents[3]
-    output_dir = _build_run_dir(output_root=args.output_root)
+    output_dir = build_sweep_run_dir(
+        output_root=args.output_root,
+        run_dir_prefix="beir_pooling_sweep",
+        reuse_latest=args.skip_existing,
+    )
 
     print(f"Using device: {args.device}")
     print("Datasets: " + ("all" if dataset_names is None else ", ".join(selected_datasets)))
@@ -416,6 +399,7 @@ def main() -> None:
             device=args.device,
             no_fp16=args.no_fp16,
             use_triton=use_triton,
+            use_sklearn=use_sklearn,
             batch_size=args.batch_size,
             k=args.k,
             document_length=args.document_length,
@@ -429,6 +413,31 @@ def main() -> None:
                 "pool_method_cli": method_cli,
                 "results_json": result_path,
             }
+        )
+
+    if args.skip_existing:
+        discovered_records = discover_sweep_result_records(
+            output_dir=output_dir,
+            file_pattern=f"beir_{safe_name(value=args.model)}_pool*_*.json",
+            model_name=args.model,
+            methods=METHODS,
+            include_fields=("dataset_name",),
+        )
+        discovered_records = [
+            record
+            for record in discovered_records
+            if record["dataset_name"] in selected_datasets
+        ]
+        if discovered_records:
+            run_records = discovered_records
+            print(
+                f"Aggregating {len(run_records)} existing/new results from {output_dir}"
+            )
+
+    if not run_records:
+        raise FileNotFoundError(
+            f"No result JSON files found in {output_dir} for model {args.model!r} "
+            f"and datasets {selected_datasets}."
         )
 
     rows = []
@@ -487,7 +496,7 @@ def main() -> None:
     _write_overview_artifacts(
         output_dir=output_dir,
         rows=rows,
-        pool_factors=args.pool_factors,
+        pool_factors=sorted({int(record["pool_factor"]) for record in run_records}),
         selected_datasets=selected_datasets,
     )
 

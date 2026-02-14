@@ -479,6 +479,7 @@ class ColBERT(SentenceTransformer):
         protected_tokens: int = 1,
         pool_method: Literal["hierarchical", "span", "kmeans"] = "hierarchical",
         use_triton: bool | None = None,
+        use_sklearn: bool = False,
     ) -> list[torch.Tensor] | ndarray | torch.Tensor:
         """
         Computes sentence embeddings.
@@ -532,6 +533,9 @@ class ColBERT(SentenceTransformer):
         use_triton
             Whether to use the Triton backend for k-means pooling when ``pool_method="kmeans"``.
             If ``None``, fastkmeans auto-detects (enabled on modern GPUs). Defaults to ``None``.
+        use_sklearn
+            Whether to use ``sklearn.cluster.KMeans`` instead of ``fastkmeans`` when
+            ``pool_method="kmeans"``. Defaults to ``False``.
 
         """
         if isinstance(sentences, list):
@@ -557,6 +561,7 @@ class ColBERT(SentenceTransformer):
                         protected_tokens=protected_tokens,
                         pool_method=pool_method,
                         use_triton=use_triton,
+                        use_sklearn=use_sklearn,
                     )
 
                     batch_embeddings = (
@@ -739,6 +744,7 @@ class ColBERT(SentenceTransformer):
                         protected_tokens=protected_tokens,
                         pool_method=pool_method,
                         use_triton=use_triton,
+                        use_sklearn=use_sklearn,
                     )
 
                 # fixes for #522 and #487 to avoid oom problems on gpu with large datasets
@@ -791,6 +797,7 @@ class ColBERT(SentenceTransformer):
         protected_tokens: int = 1,
         pool_method: Literal["hierarchical", "span", "kmeans"] = "hierarchical",
         use_triton: bool | None = None,
+        use_sklearn: bool = False,
     ) -> list[torch.Tensor]:
         pool_method = pool_method.lower()
         pooling_functions = {
@@ -814,6 +821,7 @@ class ColBERT(SentenceTransformer):
         }
         if pool_method == "kmeans":
             pool_kwargs["use_triton"] = use_triton
+            pool_kwargs["use_sklearn"] = use_sklearn
         return pooling_function(**pool_kwargs)
 
     def pool_embeddings_hierarchical(
@@ -932,6 +940,7 @@ class ColBERT(SentenceTransformer):
         pool_factor: int = 1,
         protected_tokens: int = 1,
         use_triton: bool | None = None,
+        use_sklearn: bool = False,
     ) -> list[torch.Tensor]:
         """
         Pools embeddings by k-means clustering and averaging embeddings within each cluster.
@@ -947,17 +956,31 @@ class ColBERT(SentenceTransformer):
         use_triton
             Whether to use the Triton backend for faster k-means. If ``None``, fastkmeans auto-detects.
             Defaults to ``None``.
+        use_sklearn
+            Whether to use ``sklearn.cluster.KMeans`` instead of ``fastkmeans``.
+            Defaults to ``False``.
 
         Returns
         -------
             A list of pooled embeddings for each document.
         """
-        try:
-            import fastkmeans
-        except ImportError as error:
-            raise ImportError(
-                "pool_method='kmeans' requires the 'fastkmeans' package."
-            ) from error
+        if use_sklearn:
+            try:
+                from sklearn.cluster import KMeans
+            except ImportError as error:
+                raise ImportError(
+                    "pool_method='kmeans' with use_sklearn=True requires the "
+                    "'scikit-learn' package."
+                ) from error
+
+        else:
+            try:
+                import fastkmeans
+            except ImportError as error:
+                raise ImportError(
+                    "pool_method='kmeans' requires the 'fastkmeans' package. "
+                    "Set use_sklearn=True to use scikit-learn instead."
+                ) from error
 
         pooled_embeddings = []
 
@@ -975,21 +998,35 @@ class ColBERT(SentenceTransformer):
                 continue
 
             num_clusters = max(num_embeddings // pool_factor, 1)
-            r = max(num_embeddings / num_clusters, 1.0)
-            niter = max(min(12 + math.ceil(6 * math.log2(max(r, 2))), 50), 20)
             embeddings_np = embeddings_to_pool.float().cpu().numpy()
 
-            kmeans = fastkmeans.FastKMeans(
-                embeddings_to_pool.shape[-1],
-                num_clusters,
-                niter=niter,
-                gpu=embeddings_to_pool.is_cuda,
-                verbose=False,
-                seed=42,
-                use_triton=use_triton,
-            )
-            kmeans.train(embeddings_np)
-            cluster_labels = torch.from_numpy(kmeans.predict(embeddings_np)).to(
+            r = max(num_embeddings / num_clusters, 1.0)
+            max_iter = max(min(12 + math.ceil(6 * math.log2(max(r, 2))), 50), 20)
+
+            if use_sklearn:
+                kmeans = KMeans(
+                    n_clusters=num_clusters,
+                    random_state=42,
+                    max_iter=max_iter,
+                    tol=0.0001,
+                )
+                cluster_labels_np = kmeans.fit_predict(embeddings_np)
+            else:
+                kmeans = fastkmeans.FastKMeans(
+                    embeddings_to_pool.shape[-1],
+                    num_clusters,
+                    niter=max_iter,
+                    tol=0.0001,
+                    gpu=False,  #embeddings_to_pool.is_cuda,
+                    verbose=False,
+                    seed=42,
+                    device="cpu",
+                    use_triton=False,
+                )
+
+                kmeans.train(embeddings_np)
+                cluster_labels_np = kmeans.predict(embeddings_np)
+            cluster_labels = torch.from_numpy(cluster_labels_np).to(
                 device=embeddings_to_pool.device, dtype=torch.long
             )
 
@@ -1088,6 +1125,7 @@ class ColBERT(SentenceTransformer):
         protected_tokens: int = 1,
         pool_method: Literal["hierarchical", "span", "kmeans"] = "hierarchical",
         use_triton: bool | None = None,
+        use_sklearn: bool = False,
     ) -> list[np.ndarray]:
         """
         Encodes a list of sentences using multiple processes and GPUs via
@@ -1139,6 +1177,9 @@ class ColBERT(SentenceTransformer):
         use_triton
             Whether to use the Triton backend for k-means pooling when ``pool_method="kmeans"``.
             If ``None``, fastkmeans auto-detects. Defaults to ``None``.
+        use_sklearn
+            Whether to use ``sklearn.cluster.KMeans`` instead of ``fastkmeans`` when
+            ``pool_method="kmeans"``. Defaults to ``False``.
 
         Examples
         --------
@@ -1193,6 +1234,7 @@ class ColBERT(SentenceTransformer):
                         protected_tokens,
                         pool_method,
                         use_triton,
+                        use_sklearn,
                     ]
                 )
                 last_chunk_id += 1
@@ -1214,6 +1256,7 @@ class ColBERT(SentenceTransformer):
                     protected_tokens,
                     pool_method,
                     use_triton,
+                    use_sklearn,
                 ]
             )
             last_chunk_id += 1

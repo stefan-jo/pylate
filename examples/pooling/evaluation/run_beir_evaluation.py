@@ -136,7 +136,8 @@ def write_summary(
     document_length: int,
     batch_size: int,
     k: int,
-    use_triton: bool | None = None,
+    use_triton: bool = False,
+    use_sklearn: bool = False,
 ) -> None:
     """Write a human-readable summary to a text file."""
     dataset_results, mean_results = parse_scores(scores)
@@ -146,8 +147,8 @@ def write_summary(
         f.write(f"Model:        {model_name}\n")
         f.write(f"pool_factor:  {pool_factor}\n")
         f.write(f"pool_method:  {pool_method}\n")
-        if use_triton is not None:
-            f.write(f"use_triton:   {use_triton}\n")
+        f.write(f"use_triton:   {use_triton}\n")
+        f.write(f"use_sklearn:  {use_sklearn}\n")
         f.write(f"dataset:      {dataset_name}\n")
         f.write(f"query_length: {query_length}\n")
         f.write(f"doc_length:   {document_length}\n")
@@ -237,8 +238,14 @@ def main() -> None:
         action="store_true",
         help="Use Triton backend for k-means pooling (faster on modern GPUs).",
     )
+    parser.add_argument(
+        "--use-sklearn",
+        action="store_true",
+        help="Use sklearn KMeans backend for k-means pooling.",
+    )
     args = parser.parse_args()
-    use_triton: bool | None = True if args.use_triton else None
+    use_triton: bool = args.use_triton
+    use_sklearn: bool = args.use_sklearn
     dataset_name = args.dataset_name.strip().lower()
     if dataset_name not in ALL_BEIR_DATASETS:
         raise ValueError(
@@ -275,13 +282,17 @@ def main() -> None:
             pool_factor=args.pool_factor,
             pool_method=args.pool_method,
             use_triton=use_triton,
+            use_sklearn=use_sklearn,
         )
 
     print("=" * 60)
     triton_info = f", use_triton={use_triton}" if args.pool_method == "kmeans" else ""
+    sklearn_info = (
+        f", use_sklearn={use_sklearn}" if args.pool_method == "kmeans" else ""
+    )
     print(
         "Starting BEIR evaluation with PLAID "
-        f"(pool_factor={args.pool_factor}, pool_method={args.pool_method}{triton_info}, k={args.k})"
+        f"(pool_factor={args.pool_factor}, pool_method={args.pool_method}{triton_info}{sklearn_info}, k={args.k})"
     )
     print("=" * 60)
 
@@ -378,6 +389,7 @@ def main() -> None:
         "pool_factor": args.pool_factor,
         "pool_method": args.pool_method,
         "use_triton": use_triton,
+        "use_sklearn": use_sklearn,
         "dataset_name": dataset_name,
         "query_length": query_length,
         "document_length": args.document_length,
@@ -406,6 +418,7 @@ def main() -> None:
         args.batch_size,
         args.k,
         use_triton=use_triton,
+        use_sklearn=use_sklearn,
     )
 
     _, mean_results = parse_scores(scores)
