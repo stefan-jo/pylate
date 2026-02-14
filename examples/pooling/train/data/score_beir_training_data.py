@@ -308,6 +308,12 @@ def main() -> None:
         default=None,
         help="Output directory for final DatasetDict(train).",
     )
+    parser.add_argument(
+        "--save-every-queries",
+        type=int,
+        default=1000,
+        help="Save intermediate output every N processed queries. Set 0 to disable.",
+    )
     args = parser.parse_args()
 
     if not args.input_path.exists():
@@ -315,6 +321,8 @@ def main() -> None:
 
     if not (0.0 <= args.negative_threshold_share <= 1.0):
         raise ValueError("--negative-threshold-share must be between 0 and 1.")
+    if args.save_every_queries < 0:
+        raise ValueError("--save-every-queries must be >= 0.")
 
     for name, value in [
         ("--n-positives", args.n_positives),
@@ -342,6 +350,12 @@ def main() -> None:
         raise ValueError(
             f"Unknown dataset: {dataset_name!r}. Available: {ALL_BEIR_DATASETS}"
         )
+
+    if args.output_path is None:
+        output_path = args.input_path.parent / f"{dataset_name}_scored"
+    else:
+        output_path = args.output_path / f"{dataset_name}_scored"
+    output_path.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading mined data from {args.input_path}...")
     mined_data = load_from_disk(str(args.input_path))
@@ -435,11 +449,18 @@ def main() -> None:
     print("Applying filtering and final selection...")
     skipped_queries = 0
 
-    for query_id in train_ds["query_id"]:
+    for idx, query_id in enumerate(train_ds["query_id"], start=1):
         query_id = str(query_id)
         group = scored_by_query.get(query_id)
         if group is None:
             skipped_queries += 1
+            if args.save_every_queries > 0 and idx % args.save_every_queries == 0:
+                partial_dataset = Dataset.from_dict(output_rows)
+                DatasetDict({"train": partial_dataset}).save_to_disk(str(output_path))
+                print(
+                    f"Checkpoint: saved {len(partial_dataset)} rows after "
+                    f"{idx}/{len(train_ds)} processed queries to {output_path}"
+                )
             continue
 
         positives = sorted(group["positive"], key=lambda x: x[1], reverse=True)
@@ -492,15 +513,17 @@ def main() -> None:
         output_rows["scores"].append([score for _, score, _ in selected])
         output_rows["labels"].append([label for _, _, label in selected])
 
+        if args.save_every_queries > 0 and idx % args.save_every_queries == 0:
+            partial_dataset = Dataset.from_dict(output_rows)
+            DatasetDict({"train": partial_dataset}).save_to_disk(str(output_path))
+            print(
+                f"Checkpoint: saved {len(partial_dataset)} rows after "
+                f"{idx}/{len(train_ds)} processed queries to {output_path}"
+            )
+
     output_dataset = Dataset.from_dict(output_rows)
     output_dict = DatasetDict({"train": output_dataset})
 
-    if args.output_path is None:
-        output_path = args.input_path.parent / f"{dataset_name}_scored"
-    else:
-        output_path = args.output_path / f"{dataset_name}_scored"
-
-    output_path.mkdir(parents=True, exist_ok=True)
     print(f"Saving final dataset to {output_path}...")
     output_dict.save_to_disk(str(output_path))
 
