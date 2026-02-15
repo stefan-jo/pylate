@@ -55,6 +55,7 @@ DEFAULT_PROMPT = (
     "Given a query A and a passage B, determine whether the passage contains "
     "an answer to the query by providing a prediction of either 'Yes' or 'No'."
 )
+CHECKPOINT_FILENAME = "scores_checkpoint.pt"
 
 
 def load_beir_train_split(dataset_name: str) -> tuple[list[dict[str, str]], dict[str, str], dict]:
@@ -90,6 +91,47 @@ def infer_dataset_name(input_path: Path) -> str | None:
             return candidate
 
     return None
+
+
+def resolve_checkpoint_dir(
+    output_path: Path,
+    checkpoint_dir: Path | None,
+    resume_checkpoint: Path | None,
+) -> Path:
+    if checkpoint_dir is not None:
+        return checkpoint_dir
+    if resume_checkpoint is not None:
+        return resume_checkpoint
+    return output_path.parent / f"{output_path.name}_checkpoints"
+
+
+def save_scores_checkpoint(checkpoint_dir: Path, scores: list[float], total_pairs: int) -> None:
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "scores": scores,
+            "total_pairs": total_pairs,
+        },
+        checkpoint_dir / CHECKPOINT_FILENAME,
+    )
+    print(f"Saved checkpoint to {checkpoint_dir / CHECKPOINT_FILENAME}")
+
+
+def load_scores_checkpoint(checkpoint_dir: Path) -> tuple[list[float], int]:
+    checkpoint_path = checkpoint_dir / CHECKPOINT_FILENAME
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    scores = checkpoint.get("scores")
+    if not isinstance(scores, list):
+        raise ValueError(f"Checkpoint at {checkpoint_path} does not contain a valid 'scores' list.")
+
+    total_pairs = checkpoint.get("total_pairs")
+    if total_pairs is None:
+        total_pairs = len(scores)
+
+    return [float(score) for score in scores], int(total_pairs)
 
 
 def get_llm_inputs(
@@ -160,10 +202,28 @@ def score_pairs(
     max_length: int,
     device: str,
     trust_remote_code: bool,
+    initial_scores: list[float] | None = None,
+    checkpoint_every: int = 0,
+    checkpoint_dir: Path | None = None,
 ) -> list[float]:
     """Score query-document pairs with a HF reranker model."""
     if not pairs:
         return []
+
+    total = len(pairs)
+    scores: list[float] = list(initial_scores or [])
+    if len(scores) > total:
+        raise ValueError(
+            f"Resume checkpoint has {len(scores)} scores but only {total} pairs were built."
+        )
+    if len(scores) == total:
+        if checkpoint_dir is not None:
+            save_scores_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                scores=scores,
+                total_pairs=total,
+            )
+        return scores
 
     print(f"Loading reranker '{model_name}' on device={device}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
@@ -208,13 +268,14 @@ def score_pairs(
     model = model.to(device)
     model.eval()
 
-    scores: list[float] = []
-    total = len(pairs)
+    resumed_pairs = len(scores)
+    remaining = total - resumed_pairs
+    steps_since_last_checkpoint = 0
     with torch.inference_mode():
         for start in tqdm(
-            range(0, total, batch_size),
+            range(resumed_pairs, total, batch_size),
             desc="Scoring pairs",
-            total=(total + batch_size - 1) // batch_size,
+            total=(remaining + batch_size - 1) // batch_size,
         ):
             end = min(start + batch_size, total)
             batch_pairs = pairs[start:end]
@@ -246,6 +307,25 @@ def score_pairs(
                 batch_scores = logits[:, -1, yes_token_id].view(-1).float()
 
             scores.extend(batch_scores.detach().cpu().tolist())
+            steps_since_last_checkpoint += 1
+            if (
+                checkpoint_dir is not None
+                and checkpoint_every > 0
+                and steps_since_last_checkpoint >= checkpoint_every
+            ):
+                save_scores_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    scores=scores,
+                    total_pairs=total,
+                )
+                steps_since_last_checkpoint = 0
+
+    if checkpoint_dir is not None:
+        save_scores_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            scores=scores,
+            total_pairs=total,
+        )
 
     return scores
 
@@ -309,10 +389,25 @@ def main() -> None:
         help="Output directory for final DatasetDict(train).",
     )
     parser.add_argument(
-        "--save-every-queries",
+        "--checkpoint-every",
         type=int,
-        default=1000,
-        help="Save intermediate output every N processed queries. Set 0 to disable.",
+        default=100,
+        help="Save a score checkpoint every N scoring steps (batches). Set 0 to disable periodic saves.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory where score checkpoints are written. "
+            "Defaults to '<output_dir_name>_checkpoints' next to the output path."
+        ),
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Checkpoint directory to resume score computation from.",
     )
     args = parser.parse_args()
 
@@ -321,8 +416,11 @@ def main() -> None:
 
     if not (0.0 <= args.negative_threshold_share <= 1.0):
         raise ValueError("--negative-threshold-share must be between 0 and 1.")
-    if args.save_every_queries < 0:
-        raise ValueError("--save-every-queries must be >= 0.")
+    if args.checkpoint_every < 0:
+        raise ValueError("--checkpoint-every must be >= 0.")
+    if args.resume_checkpoint is not None and not args.resume_checkpoint.exists():
+        raise FileNotFoundError(f"Resume checkpoint directory does not exist: {args.resume_checkpoint}")
+
 
     for name, value in [
         ("--n-positives", args.n_positives),
@@ -356,6 +454,12 @@ def main() -> None:
     else:
         output_path = args.output_path / f"{dataset_name}_scored"
     output_path.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = resolve_checkpoint_dir(
+        output_path=output_path,
+        checkpoint_dir=args.checkpoint_dir,
+        resume_checkpoint=args.resume_checkpoint,
+    )
+    print(f"Checkpoint directory: {checkpoint_dir}")
 
     print(f"Loading mined data from {args.input_path}...")
     mined_data = load_from_disk(str(args.input_path))
@@ -416,15 +520,41 @@ def main() -> None:
     if not text_pairs:
         raise ValueError("No valid (query, doc) pairs found after ID-to-text mapping.")
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    scores = score_pairs(
-        pairs=text_pairs,
-        model_name=args.model_name,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        device=device,
-        trust_remote_code=args.trust_remote_code,
-    )
+    total_pairs = len(text_pairs)
+    resume_scores: list[float] = []
+    if args.resume_checkpoint is not None:
+        resume_scores, resumed_total_pairs = load_scores_checkpoint(args.resume_checkpoint)
+        if resumed_total_pairs != total_pairs:
+            raise ValueError(
+                "Resume checkpoint was created for a different number of pairs: "
+                f"{resumed_total_pairs} != {total_pairs}"
+            )
+        if len(resume_scores) > total_pairs:
+            raise ValueError(
+                "Resume checkpoint contains more scores than available pairs: "
+                f"{len(resume_scores)} > {total_pairs}"
+            )
+        print(
+            "Loaded resume checkpoint with "
+            f"{len(resume_scores)}/{total_pairs} scored pairs."
+        )
+
+    if len(resume_scores) == total_pairs:
+        print("All pairs already scored in checkpoint. Skipping scoring.")
+        scores = resume_scores
+    else:
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        scores = score_pairs(
+            pairs=text_pairs,
+            model_name=args.model_name,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            device=device,
+            trust_remote_code=args.trust_remote_code,
+            initial_scores=resume_scores,
+            checkpoint_every=args.checkpoint_every,
+            checkpoint_dir=checkpoint_dir,
+        )
 
     scored_by_query: dict[str, dict[str, list[tuple[str, float]]]] = defaultdict(
         lambda: {
@@ -449,18 +579,11 @@ def main() -> None:
     print("Applying filtering and final selection...")
     skipped_queries = 0
 
-    for idx, query_id in enumerate(train_ds["query_id"], start=1):
+    for query_id in train_ds["query_id"]:
         query_id = str(query_id)
         group = scored_by_query.get(query_id)
         if group is None:
             skipped_queries += 1
-            if args.save_every_queries > 0 and idx % args.save_every_queries == 0:
-                partial_dataset = Dataset.from_dict(output_rows)
-                DatasetDict({"train": partial_dataset}).save_to_disk(str(output_path))
-                print(
-                    f"Checkpoint: saved {len(partial_dataset)} rows after "
-                    f"{idx}/{len(train_ds)} processed queries to {output_path}"
-                )
             continue
 
         positives = sorted(group["positive"], key=lambda x: x[1], reverse=True)
@@ -512,14 +635,6 @@ def main() -> None:
         output_rows["document_ids"].append([doc_id for doc_id, _, _ in selected])
         output_rows["scores"].append([score for _, score, _ in selected])
         output_rows["labels"].append([label for _, _, label in selected])
-
-        if args.save_every_queries > 0 and idx % args.save_every_queries == 0:
-            partial_dataset = Dataset.from_dict(output_rows)
-            DatasetDict({"train": partial_dataset}).save_to_disk(str(output_path))
-            print(
-                f"Checkpoint: saved {len(partial_dataset)} rows after "
-                f"{idx}/{len(train_ds)} processed queries to {output_path}"
-            )
 
     output_dataset = Dataset.from_dict(output_rows)
     output_dict = DatasetDict({"train": output_dataset})
