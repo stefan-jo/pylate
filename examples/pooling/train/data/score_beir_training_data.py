@@ -9,6 +9,7 @@ import random
 import sys
 from collections import defaultdict
 from pathlib import Path
+from statistics import median
 
 import torch
 from datasets import Dataset, DatasetDict, load_from_disk
@@ -114,7 +115,7 @@ def save_scores_checkpoint(checkpoint_dir: Path, scores: list[float], total_pair
         },
         checkpoint_dir / CHECKPOINT_FILENAME,
     )
-    print(f"Saved checkpoint to {checkpoint_dir / CHECKPOINT_FILENAME}")
+    print(f"Saved checkpoint to {checkpoint_dir / CHECKPOINT_FILENAME}", flush=True)
 
 
 def load_scores_checkpoint(checkpoint_dir: Path) -> tuple[list[float], int]:
@@ -361,7 +362,7 @@ def main() -> None:
         type=float,
         default=0.95,
         help=(
-            "Drop negatives with score > share * min_positive_score for that query."
+            "Drop negatives with score > share * median_positive_score for that query."
         ),
     )
     parser.add_argument("--n-positives", type=int, default=1)
@@ -594,8 +595,8 @@ def main() -> None:
             skipped_queries += 1
             continue
 
-        min_positive_score = min(score for _, score in positives)
-        threshold = args.negative_threshold_share * min_positive_score
+        median_positive_score = median(score for _, score in positives)
+        threshold = args.negative_threshold_share * median_positive_score
 
         hard_negs = [item for item in hard_negs if item[1] <= threshold]
         random_negs = [item for item in random_negs if item[1] <= threshold]
@@ -606,11 +607,34 @@ def main() -> None:
         selected_hard = hard_sorted[: args.n_hard_negatives]
 
         remaining_hard = hard_sorted[args.n_hard_negatives :]
-        medium_k = min(args.n_medium_negatives, len(remaining_hard))
-        selected_medium = rng.sample(remaining_hard, k=medium_k)
+        medium_pool = list(remaining_hard)
+        rng.shuffle(medium_pool)
+        medium_k = min(args.n_medium_negatives, len(medium_pool))
+        selected_medium = medium_pool[:medium_k]
+        medium_pool = medium_pool[medium_k:]
 
-        random_k = min(args.n_random_negatives, len(random_negs))
-        selected_random = rng.sample(random_negs, k=random_k)
+        random_pool = list(random_negs)
+        rng.shuffle(random_pool)
+        random_k = min(args.n_random_negatives, len(random_pool))
+        selected_random = random_pool[:random_k]
+        random_pool = random_pool[random_k:]
+
+        requested_negatives = (
+            args.n_hard_negatives + args.n_medium_negatives + args.n_random_negatives
+        )
+        selected_negatives = (
+            len(selected_hard) + len(selected_medium) + len(selected_random)
+        )
+        remaining_needed = requested_negatives - selected_negatives
+
+        if remaining_needed > 0:
+            extra_medium = min(remaining_needed, len(medium_pool))
+            selected_medium.extend(medium_pool[:extra_medium])
+            remaining_needed -= extra_medium
+
+        if remaining_needed > 0:
+            extra_random = min(remaining_needed, len(random_pool))
+            selected_random.extend(random_pool[:extra_random])
 
         selected = [
             (doc_id, score, "positive")
