@@ -72,6 +72,32 @@ def test_pooling_method_validation() -> None:
         )
 
 
+def test_pooling_factor_validation() -> None:
+    model = _make_model()
+    document_embeddings = [torch.tensor([[1.0, 1.0], [2.0, 2.0]])]
+
+    with pytest.raises(ValueError, match="pool_factor must be >= 1"):
+        model._pool_document_embeddings(
+            documents_embeddings=document_embeddings,
+            pool_factor=0,
+            protected_tokens=1,
+            pool_method="span",
+        )
+
+
+def test_pooling_protected_tokens_validation() -> None:
+    model = _make_model()
+    document_embeddings = [torch.tensor([[1.0, 1.0], [2.0, 2.0]])]
+
+    with pytest.raises(ValueError, match="protected_tokens must be >= 0"):
+        model._pool_document_embeddings(
+            documents_embeddings=document_embeddings,
+            pool_factor=2,
+            protected_tokens=-1,
+            pool_method="span",
+        )
+
+
 def test_kmeans_pooling_with_fastkmeans_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     class DummyFastKMeans:
         def __init__(self, dim: int, n_clusters: int, **kwargs) -> None:

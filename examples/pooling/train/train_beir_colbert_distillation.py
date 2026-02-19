@@ -12,6 +12,7 @@ from sentence_transformers import (
     SentenceTransformerTrainer,
     SentenceTransformerTrainingArguments,
 )
+from sentence_transformers.evaluation.SentenceEvaluator import SentenceEvaluator
 
 from pylate import evaluation, losses, models, utils
 
@@ -78,6 +79,22 @@ def normalize_cli_list(values: list[str] | None, lowercase: bool = True) -> list
     return items or None
 
 
+def normalize_cli_int_list(values: list[str] | None) -> list[int] | None:
+    items = normalize_cli_list(values=values, lowercase=False)
+    if items is None:
+        return None
+
+    parsed_values: list[int] = []
+    for value in items:
+        try:
+            parsed_values.append(int(value))
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid integer in list argument: {value!r}."
+            ) from error
+    return parsed_values
+
+
 def infer_dataset_name(input_path: Path) -> str | None:
     """Infer a BEIR dataset name from a scored input folder path."""
     stem = input_path.name.removesuffix("_scored")
@@ -119,6 +136,67 @@ def load_train_split(path: Path) -> Dataset:
             raise ValueError("Input DatasetDict must contain a 'train' split.")
         return dataset["train"]
     return dataset
+
+
+class PooledColBERTForEval:
+    """Wrapper that applies training pooling settings to document encoding."""
+
+    def __init__(
+        self,
+        model,
+        pool_factor: int,
+        pool_method: str,
+        protected_tokens: int,
+        use_sklearn: bool,
+    ) -> None:
+        self.model = model
+        self.pool_factor = pool_factor
+        self.pool_method = pool_method
+        self.protected_tokens = protected_tokens
+        self.use_sklearn = use_sklearn
+
+    def encode(self, sentences, is_query: bool = True, **kwargs):
+        if not is_query and self.pool_factor > 1:
+            kwargs["pool_factor"] = self.pool_factor
+            kwargs["pool_method"] = self.pool_method
+            kwargs["protected_tokens"] = self.protected_tokens
+            kwargs["use_sklearn"] = self.use_sklearn
+        return self.model.encode(sentences=sentences, is_query=is_query, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
+
+
+class PoolingAwareEvaluator(SentenceEvaluator):
+    """Wrap an evaluator so it uses pooled document encoding during eval."""
+
+    def __init__(
+        self,
+        evaluator,
+        pool_factor: int,
+        pool_method: str,
+        protected_tokens: int,
+        use_sklearn: bool,
+    ) -> None:
+        super().__init__()
+        self.evaluator = evaluator
+        self.pool_factor = pool_factor
+        self.pool_method = pool_method
+        self.protected_tokens = protected_tokens
+        self.use_sklearn = use_sklearn
+
+    def __call__(self, model, *args, **kwargs):
+        wrapped_model = PooledColBERTForEval(
+            model=model,
+            pool_factor=self.pool_factor,
+            pool_method=self.pool_method,
+            protected_tokens=self.protected_tokens,
+            use_sklearn=self.use_sklearn,
+        )
+        return self.evaluator(wrapped_model, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.evaluator, name)
 
 
 def main() -> None:
@@ -213,6 +291,52 @@ def main() -> None:
         help="Apply per-query min/max normalization inside distillation loss.",
     )
     parser.add_argument(
+        "--pool-factor",
+        type=int,
+        default=1,
+        help=(
+            "Document pooling factor used inside distillation loss. "
+            "Use 1 to disable pooling."
+        ),
+    )
+    parser.add_argument(
+        "--pool-factors",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional pool factors sampled uniformly per training batch "
+            "(space/comma separated). Overrides --pool-factor when provided."
+        ),
+    )
+    parser.add_argument(
+        "--pool-method",
+        type=str,
+        default="hierarchical",
+        choices=["hierarchical", "span", "kmeans"],
+        help="Document pooling method used when --pool-factor > 1.",
+    )
+    parser.add_argument(
+        "--eval-pool-factor",
+        type=int,
+        default=None,
+        help=(
+            "Pool factor used for epoch evaluation when --eval-every-epoch is enabled. "
+            "Defaults to the first value from --pool-factors/--pool-factor."
+        ),
+    )
+    parser.add_argument(
+        "--protected-tokens",
+        type=int,
+        default=1,
+        help="Number of leading document tokens excluded from pooling.",
+    )
+    parser.add_argument(
+        "--pool-use-sklearn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use sklearn backend for kmeans pooling.",
+    )
+    parser.add_argument(
         "--eval-every-epoch",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -281,6 +405,10 @@ def main() -> None:
         raise ValueError("--fixed-n-ways must be > 0.")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be > 0.")
+    if args.pool_factor <= 0 and args.pool_factors is None:
+        raise ValueError("--pool-factor must be > 0.")
+    if args.protected_tokens < 0:
+        raise ValueError("--protected-tokens must be >= 0.")
     if args.num_train_epochs <= 0:
         raise ValueError("--num-train-epochs must be > 0.")
     if args.max_steps == 0 or args.max_steps < -1:
@@ -319,6 +447,22 @@ def main() -> None:
                 f"Unknown NanoBEIR datasets: {invalid_datasets}. "
                 f"Available: {ALL_NANOBEIR_DATASETS}"
             )
+
+    pool_factors = normalize_cli_int_list(args.pool_factors)
+    if pool_factors is None:
+        pool_factors = [args.pool_factor]
+    if any(pool_factor <= 0 for pool_factor in pool_factors):
+        raise ValueError(f"All pool factors must be > 0, got: {pool_factors}")
+    eval_pool_factor = args.eval_pool_factor
+    if eval_pool_factor is None:
+        eval_pool_factor = pool_factors[0]
+    if eval_pool_factor <= 0:
+        raise ValueError("--eval-pool-factor must be > 0 when provided.")
+    if eval_pool_factor != 1 and eval_pool_factor not in pool_factors:
+        raise ValueError(
+            "--eval-pool-factor must be 1 or included in --pool-factors/--pool-factor. "
+            f"Got eval={eval_pool_factor}, train factors={pool_factors}."
+        )
 
     print(f"Loading scored training data from: {args.train_path}")
     train_dataset = load_train_split(args.train_path)
@@ -454,6 +598,14 @@ def main() -> None:
         truncation=True,
         device=args.device,
     )
+    print(
+        "Pooling-aware distillation settings: "
+        f"pool_factors={pool_factors}, "
+        f"eval_pool_factor={eval_pool_factor}, "
+        f"pool_method={args.pool_method}, "
+        f"protected_tokens={args.protected_tokens}, "
+        f"use_sklearn={args.pool_use_sklearn}"
+    )
 
     evaluator = None
     eval_strategy = "no"
@@ -469,6 +621,17 @@ def main() -> None:
             evaluator_kwargs["dataset_names"] = eval_datasets
 
         evaluator = evaluation.NanoBEIREvaluator(**evaluator_kwargs)
+        if eval_pool_factor > 1:
+            evaluator = PoolingAwareEvaluator(
+                evaluator=evaluator,
+                pool_factor=eval_pool_factor,
+                pool_method=args.pool_method,
+                protected_tokens=args.protected_tokens,
+                use_sklearn=args.pool_use_sklearn,
+            )
+            print(
+                "NanoBEIR evaluation will apply document pooling with eval settings."
+            )
         eval_strategy = "epoch"
         load_best_model_at_end = True
         metric_for_best_model = "eval_NanoBEIR_mean_MaxSim_ndcg@10"
@@ -505,6 +668,12 @@ def main() -> None:
     train_loss = losses.Distillation(
         model=model,
         normalize_scores=args.normalize_scores,
+        pool_factor=pool_factors[0],
+        pool_factors=pool_factors,
+        pool_factor_seed=args.seed,
+        pool_method=args.pool_method,
+        protected_tokens=args.protected_tokens,
+        use_sklearn=args.pool_use_sklearn,
     )
 
     trainer = SentenceTransformerTrainer(

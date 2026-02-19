@@ -799,6 +799,12 @@ class ColBERT(SentenceTransformer):
         use_triton: bool | None = None,
         use_sklearn: bool = False,
     ) -> list[torch.Tensor]:
+        if pool_factor < 1:
+            raise ValueError(f"pool_factor must be >= 1, got {pool_factor}.")
+        if protected_tokens < 0:
+            raise ValueError(
+                f"protected_tokens must be >= 0, got {protected_tokens}."
+            )
         pool_method = pool_method.lower()
         pooling_functions = {
             "hierarchical": self.pool_embeddings_hierarchical,
@@ -866,7 +872,7 @@ class ColBERT(SentenceTransformer):
             cosine_similarities = torch.mm(
                 input=embeddings_to_pool, mat2=embeddings_to_pool.t()
             )
-            distance_matrix = 1 - cosine_similarities.cpu().numpy()
+            distance_matrix = 1 - cosine_similarities.detach().cpu().numpy()
 
             # Perform hierarchical clustering using Ward's method
             clusters = hierarchy.linkage(distance_matrix, method="ward")
@@ -998,7 +1004,7 @@ class ColBERT(SentenceTransformer):
                 continue
 
             num_clusters = max(num_embeddings // pool_factor, 1)
-            embeddings_np = embeddings_to_pool.float().cpu().numpy()
+            embeddings_np = embeddings_to_pool.detach().float().cpu().numpy()
 
             r = max(num_embeddings / num_clusters, 1.0)
             max_iter = max(min(12 + math.ceil(6 * math.log2(max(r, 2))), 50), 20)
