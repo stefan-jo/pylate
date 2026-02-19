@@ -59,6 +59,31 @@ DEFAULT_PROMPT = (
 CHECKPOINT_FILENAME = "scores_checkpoint.pt"
 
 
+def compute_anchor_positive_score(
+    positives: list[tuple[str, float]],
+    metric: str,
+    source: str,
+    n_selected: int,
+) -> float:
+    """Compute anchor score for negative-threshold filtering."""
+    if source == "all":
+        selected = positives
+    elif source == "selected":
+        selected = positives[:n_selected]
+    else:
+        raise ValueError(f"Unknown anchor positive source: {source!r}")
+
+    positive_scores = [score for _, score in selected]
+    if not positive_scores:
+        raise ValueError("Cannot compute anchor positive score from an empty positives set.")
+
+    if metric == "median":
+        return float(median(positive_scores))
+    if metric == "min":
+        return float(min(positive_scores))
+    raise ValueError(f"Unknown anchor positive metric: {metric!r}")
+
+
 def load_beir_train_split(dataset_name: str) -> tuple[list[dict[str, str]], dict[str, str], dict]:
     """Load one BEIR dataset train split, including cqadupstack subsets."""
     if dataset_name.startswith("cqadupstack/"):
@@ -362,7 +387,22 @@ def main() -> None:
         type=float,
         default=0.95,
         help=(
-            "Drop negatives with score > share * median_positive_score for that query."
+            "Drop negatives with score > share * anchor_positive_score for that query."
+        ),
+    )
+    parser.add_argument(
+        "--anchor-positive-score",
+        type=str,
+        default="median_all",
+        choices=[
+            "median_all",
+            "median_selected",
+            "min_all",
+            "min_selected",
+        ],
+        help=(
+            "How to compute anchor_positive_score for filtering negatives. "
+            "'all' uses all positives, while 'selected' uses top --n-positives positives."
         ),
     )
     parser.add_argument("--n-positives", type=int, default=1)
@@ -595,8 +635,14 @@ def main() -> None:
             skipped_queries += 1
             continue
 
-        median_positive_score = median(score for _, score in positives)
-        threshold = args.negative_threshold_share * median_positive_score
+        anchor_metric, anchor_source = args.anchor_positive_score.split("_", maxsplit=1)
+        anchor_positive_score = compute_anchor_positive_score(
+            positives=positives,
+            metric=anchor_metric,
+            source=anchor_source,
+            n_selected=args.n_positives,
+        )
+        threshold = args.negative_threshold_share * anchor_positive_score
 
         hard_negs = [item for item in hard_negs if item[1] <= threshold]
         random_negs = [item for item in random_negs if item[1] <= threshold]
