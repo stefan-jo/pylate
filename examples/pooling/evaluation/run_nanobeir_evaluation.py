@@ -40,6 +40,19 @@ ALL_NANOBEIR_DATASETS = [
     "scifact",
     "touche2020",
 ]
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_QUERY_LENGTH = 48
+DEFAULT_DOCUMENT_LENGTH = 180
+
+
+def _run_config_suffix(query_length: int, document_length: int) -> str:
+    if (
+        query_length == DEFAULT_QUERY_LENGTH
+        and document_length == DEFAULT_DOCUMENT_LENGTH
+    ):
+        return ""
+    return f"_q{query_length}_d{document_length}"
+
 
 def parse_scores(scores: dict) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
     """Split raw evaluator scores into per-dataset and mean results."""
@@ -69,6 +82,8 @@ def write_summary(
     pool_method: str,
     dataset_names: list[str],
     batch_size: int,
+    query_length: int,
+    document_length: int,
     use_triton: bool = False,
     use_sklearn: bool = False,
 ) -> None:
@@ -84,6 +99,8 @@ def write_summary(
         f.write(f"use_sklearn:  {use_sklearn}\n")
         f.write(f"datasets:     {', '.join(dataset_names)}\n")
         f.write(f"batch_size:   {batch_size}\n")
+        f.write(f"query_length: {query_length}\n")
+        f.write(f"document_length: {document_length}\n")
         f.write(f"Time:         {evaluation_time_seconds:.2f} s ({evaluation_time_seconds/60:.2f} min)\n\n")
         f.write("Mean Results Across All Datasets:\n")
         for metric in ["ndcg@10", "mrr@10", "map@100", "recall@10", "recall@100", "accuracy@10"]:
@@ -133,8 +150,20 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
+        default=DEFAULT_BATCH_SIZE,
         help="Batch size for encoding (reduce if OOM).",
+    )
+    parser.add_argument(
+        "--query-length",
+        type=int,
+        default=DEFAULT_QUERY_LENGTH,
+        help="Maximum query token length for ColBERT.",
+    )
+    parser.add_argument(
+        "--document-length",
+        type=int,
+        default=DEFAULT_DOCUMENT_LENGTH,
+        help="Maximum document token length for ColBERT.",
     )
     parser.add_argument(
         "--datasets",
@@ -192,8 +221,8 @@ def main() -> None:
         model_name_or_path=args.model,
         device=device,
         truncation=True,
-        query_length=32,
-        document_length=180,
+        query_length=args.query_length,
+        document_length=args.document_length,
     )
 
     if not args.no_fp16:
@@ -226,7 +255,9 @@ def main() -> None:
     )
     print(
         "Starting NanoBEIR evaluation"
-        f"(pool_factor={args.pool_factor}, pool_method={args.pool_method}{triton_info}{sklearn_info})"
+        f"(pool_factor={args.pool_factor}, pool_method={args.pool_method}, "
+        f"batch_size={args.batch_size}, query_length={args.query_length}, "
+        f"document_length={args.document_length}{triton_info}{sklearn_info})"
     )
     print("=" * 60)
     if torch.cuda.is_available():
@@ -249,6 +280,7 @@ def main() -> None:
     prefix = (
         f"nanobeir_{safe_name}_pool{args.pool_factor}_{args.pool_method}"
         f"{dataset_suffix(dataset_names)}"
+        f"{_run_config_suffix(args.query_length, args.document_length)}"
     )
 
     _, mean_results = parse_scores(scores)
@@ -262,6 +294,8 @@ def main() -> None:
         "use_sklearn": use_sklearn,
         "dataset_names": selected_datasets,
         "batch_size": args.batch_size,
+        "query_length": args.query_length,
+        "document_length": args.document_length,
         "evaluation_time_seconds": evaluation_time,
         "mean_ndcg_at_10": mean_ndcg_at_10,
         "scores": scores_to_serializable(scores),
@@ -281,6 +315,8 @@ def main() -> None:
         args.pool_method,
         selected_datasets,
         args.batch_size,
+        args.query_length,
+        args.document_length,
         use_triton=use_triton,
         use_sklearn=use_sklearn,
     )

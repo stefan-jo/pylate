@@ -41,7 +41,10 @@ import matplotlib.pyplot as plt
 
 DEFAULT_MODEL = "mixedbread-ai/mxbai-edge-colbert-v0-32m"
 # DEFAULT_POOL_FACTORS = [1, 2, 3, 4, 5, 7, 10, 15, 20]
-DEFAULT_POOL_FACTORS = [1, 2, 3, 5, 7, 10, 15, 20]
+DEFAULT_POOL_FACTORS = [1, 2, 3, 4, 5, 6]
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_TOP_K = 20
+DEFAULT_DOCUMENT_LENGTH = 180
 ALL_BEIR_DATASETS = [
 #    "arguana",
 #    "climate-fever",
@@ -55,8 +58,8 @@ ALL_BEIR_DATASETS = [
 #    "quora",
     "scidocs",  # core
     "scifact",  # core
-#    "trec-covid",  # extended
-#    "webis-touche2020",  # extended
+    "trec-covid",  # extended
+    "webis-touche2020",  # extended
 #    "cqadupstack/android",
 #    "cqadupstack/english",
 #    "cqadupstack/gaming",
@@ -76,6 +79,12 @@ METHODS = [
     ("slice", "span"),
 ]
 METRICS = ["ndcg@10", "mrr@10", "map@100", "recall@10", "recall@100"]
+
+
+def _run_config_suffix(k: int, document_length: int) -> str:
+    if k == DEFAULT_TOP_K and document_length == DEFAULT_DOCUMENT_LENGTH:
+        return ""
+    return f"_k{k}_d{document_length}"
 
 
 def _run_single_evaluation(
@@ -134,11 +143,14 @@ def _result_json_path(
     pool_factor: int,
     method_cli: str,
     dataset_name: str,
+    k: int,
+    document_length: int,
 ) -> Path:
     model_name_safe = safe_name(value=model_name)
     dataset_name_safe = safe_name(value=dataset_name)
     return output_dir / (
-        f"beir_{model_name_safe}_pool{pool_factor}_{method_cli}_ds_{dataset_name_safe}.json"
+        f"beir_{model_name_safe}_pool{pool_factor}_{method_cli}_ds_{dataset_name_safe}"
+        f"{_run_config_suffix(k, document_length)}.json"
     )
 
 
@@ -284,19 +296,19 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
+        default=DEFAULT_BATCH_SIZE,
         help="Batch size passed to each evaluation run.",
     )
     parser.add_argument(
         "--k",
         type=int,
-        default=20,
+        default=DEFAULT_TOP_K,
         help="Top-k passed to each evaluation run.",
     )
     parser.add_argument(
         "--document-length",
         type=int,
-        default=180,
+        default=DEFAULT_DOCUMENT_LENGTH,
         help="Document length passed to each evaluation run.",
     )
     parser.add_argument(
@@ -374,6 +386,8 @@ def main() -> None:
             pool_factor=pool_factor,
             method_cli=method_cli,
             dataset_name=dataset_name,
+            k=args.k,
+            document_length=args.document_length,
         )
         if args.skip_existing and result_path.exists():
             run_records.append(
@@ -421,6 +435,10 @@ def main() -> None:
             file_pattern=f"beir_{safe_name(value=args.model)}_pool*_*.json",
             model_name=args.model,
             methods=METHODS,
+            filters={
+                "k": args.k,
+                "document_length": args.document_length,
+            },
             include_fields=("dataset_name",),
         )
         discovered_records = [

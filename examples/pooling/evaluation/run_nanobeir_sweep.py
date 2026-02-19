@@ -28,7 +28,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 DEFAULT_MODEL = "mixedbread-ai/mxbai-edge-colbert-v0-32m"
-DEFAULT_POOL_FACTORS = [1, 2, 3, 4, 5, 7, 10, 15, 20]
+DEFAULT_POOL_FACTORS = [1, 2, 3, 4, 5, 6]
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_QUERY_LENGTH = 48
+DEFAULT_DOCUMENT_LENGTH = 180
 ALL_NANOBEIR_DATASETS = [
     "arguana",
     "climatefever",
@@ -45,10 +48,19 @@ ALL_NANOBEIR_DATASETS = [
     "touche2020",
 ]
 METHODS = [
-  #  ("hier", "hierarchical"),
+    ("hier", "hierarchical"),
     ("kmeans", "kmeans"),
-  #  ("slice", "span"),
+    ("slice", "span"),
 ]
+
+
+def _run_config_suffix(query_length: int, document_length: int) -> str:
+    if (
+        query_length == DEFAULT_QUERY_LENGTH
+        and document_length == DEFAULT_DOCUMENT_LENGTH
+    ):
+        return ""
+    return f"_q{query_length}_d{document_length}"
 
 
 def _run_single_evaluation(
@@ -59,6 +71,9 @@ def _run_single_evaluation(
     pool_factor: int,
     method_cli: str,
     device: str,
+    batch_size: int,
+    query_length: int,
+    document_length: int,
     no_fp16: bool,
     dataset_names: list[str] | None,
     use_triton: bool = False,
@@ -75,6 +90,12 @@ def _run_single_evaluation(
         str(output_dir),
         "--device",
         device,
+        "--batch-size",
+        str(batch_size),
+        "--query-length",
+        str(query_length),
+        "--document-length",
+        str(document_length),
     ]
     if no_fp16:
         cli_args.append("--no-fp16")
@@ -98,11 +119,14 @@ def _result_json_path(
     pool_factor: int,
     method_cli: str,
     dataset_names: list[str] | None,
+    query_length: int,
+    document_length: int,
 ) -> Path:
     model_name_safe = safe_name(value=model_name)
     return output_dir / (
         f"nanobeir_{model_name_safe}_pool{pool_factor}_{method_cli}"
-        f"{dataset_suffix(dataset_names)}.json"
+        f"{dataset_suffix(dataset_names)}"
+        f"{_run_config_suffix(query_length, document_length)}.json"
     )
 
 
@@ -248,6 +272,24 @@ def main() -> None:
         help="CUDA device string, e.g. cuda or cuda:0.",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Batch size passed to each evaluation run.",
+    )
+    parser.add_argument(
+        "--query-length",
+        type=int,
+        default=DEFAULT_QUERY_LENGTH,
+        help="Query token length passed to each evaluation run.",
+    )
+    parser.add_argument(
+        "--document-length",
+        type=int,
+        default=DEFAULT_DOCUMENT_LENGTH,
+        help="Document token length passed to each evaluation run.",
+    )
+    parser.add_argument(
         "--no-fp16",
         action="store_true",
         help="Pass --no-fp16 to each evaluation run.",
@@ -299,6 +341,11 @@ def main() -> None:
 
     print(f"Using GPU device: {args.device}")
     print("Datasets: " + ("all" if dataset_names is None else ", ".join(selected_datasets)))
+    print(
+        "Run config: "
+        f"batch_size={args.batch_size}, query_length={args.query_length}, "
+        f"document_length={args.document_length}"
+    )
     print(f"Sweep output directory: {output_dir}")
     print(f"Evaluation script: {eval_script}")
 
@@ -318,6 +365,8 @@ def main() -> None:
             pool_factor=pool_factor,
             method_cli=method_cli,
             dataset_names=dataset_names,
+            query_length=args.query_length,
+            document_length=args.document_length,
         )
         if args.skip_existing and result_path.exists():
             run_records.append(
@@ -340,6 +389,9 @@ def main() -> None:
             pool_factor=pool_factor,
             method_cli=method_cli,
             device=args.device,
+            batch_size=args.batch_size,
+            query_length=args.query_length,
+            document_length=args.document_length,
             no_fp16=args.no_fp16,
             dataset_names=dataset_names,
             use_triton=use_triton,
@@ -362,7 +414,11 @@ def main() -> None:
             file_pattern=f"nanobeir_{safe_name(value=args.model)}_pool*_*.json",
             model_name=args.model,
             methods=METHODS,
-            filters={"dataset_names": selected_datasets},
+            filters={
+                "dataset_names": selected_datasets,
+                "query_length": args.query_length,
+                "document_length": args.document_length,
+            },
         )
         if discovered_records:
             run_records = discovered_records

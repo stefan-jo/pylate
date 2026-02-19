@@ -83,6 +83,15 @@ BEIR_QUERY_LENGTHS = {
 }
 
 BEIR_METRICS = ["ndcg@10", "mrr@10", "map@100", "recall@10", "recall@100"]
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_TOP_K = 20
+DEFAULT_DOCUMENT_LENGTH = 180
+
+
+def _run_config_suffix(k: int, document_length: int) -> str:
+    if k == DEFAULT_TOP_K and document_length == DEFAULT_DOCUMENT_LENGTH:
+        return ""
+    return f"_k{k}_d{document_length}"
 
 
 def parse_scores(
@@ -192,13 +201,13 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
+        default=DEFAULT_BATCH_SIZE,
         help="Batch size for encoding queries/documents (reduce if OOM).",
     )
     parser.add_argument(
         "--k",
         type=int,
-        default=20,
+        default=DEFAULT_TOP_K,
         help="Top-k retrieved documents per query for evaluation.",
     )
     parser.add_argument(
@@ -213,7 +222,7 @@ def main() -> None:
     parser.add_argument(
         "--document-length",
         type=int,
-        default=180,
+        default=DEFAULT_DOCUMENT_LENGTH,
         help="Maximum document token length.",
     )
     parser.add_argument(
@@ -379,6 +388,7 @@ def main() -> None:
     prefix = (
         f"beir_{safe_name}_pool{args.pool_factor}_{args.pool_method}"
         f"_ds_{dataset_name.replace('/', '_')}"
+        f"{_run_config_suffix(args.k, args.document_length)}"
     )
 
     _, mean_results = parse_scores(scores)
