@@ -54,6 +54,49 @@ METHODS = [
 ]
 
 
+def _parse_selected_methods(method_values: list[str] | None) -> list[tuple[str, str]]:
+    if method_values is None:
+        return METHODS.copy()
+
+    requested_methods = normalize_cli_list(
+        method_values, lowercase=True, unique=False
+    )
+    if requested_methods is None:
+        return METHODS.copy()
+
+    alias_to_cli = {
+        "hier": "hierarchical",
+        "hierarchical": "hierarchical",
+        "kmeans": "kmeans",
+        "slice": "span",
+        "span": "span",
+    }
+    method_names = {method_cli: method_name for method_name, method_cli in METHODS}
+
+    selected_methods: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    invalid_methods: list[str] = []
+    for requested_method in requested_methods:
+        method_cli = alias_to_cli.get(requested_method)
+        if method_cli is None:
+            invalid_methods.append(requested_method)
+            continue
+        if method_cli in seen:
+            continue
+        seen.add(method_cli)
+        selected_methods.append((method_names[method_cli], method_cli))
+
+    if invalid_methods:
+        raise ValueError(
+            f"Unknown pooling methods: {sorted(set(invalid_methods))}. "
+            "Available: hier, kmeans, slice (aliases: hierarchical, span)."
+        )
+    if not selected_methods:
+        raise ValueError("No pooling methods selected.")
+
+    return selected_methods
+
+
 def _run_config_suffix(query_length: int, document_length: int) -> str:
     if (
         query_length == DEFAULT_QUERY_LENGTH
@@ -159,6 +202,7 @@ def _write_overview_artifacts(
     rows: list[dict],
     per_dataset_rows: list[dict],
     pool_factors: list[int],
+    methods: list[tuple[str, str]],
 ) -> None:
     df = pd.DataFrame(rows)
     df = df.sort_values(["pool_factor", "method_order"]).reset_index(drop=True)
@@ -178,7 +222,7 @@ def _write_overview_artifacts(
 
     ndcg_pivot = (
         df.pivot(index="pool_factor", columns="pool_method", values="mean_ndcg@10")
-        .reindex(index=pool_factors, columns=[method_name for method_name, _ in METHODS])
+        .reindex(index=pool_factors, columns=[method_name for method_name, _ in methods])
         .reset_index()
     )
     ndcg_table_md_path = output_dir / "overview_mean_ndcg_at_10_table.md"
@@ -187,7 +231,7 @@ def _write_overview_artifacts(
         f.write("\n")
 
     plt.figure(figsize=(10, 6))
-    for method_name, _ in METHODS:
+    for method_name, _ in methods:
         method_df = df[df["pool_method"] == method_name].sort_values("pool_factor")
         plt.plot(
             method_df["pool_factor"],
@@ -248,6 +292,16 @@ def main() -> None:
         nargs="+",
         default=DEFAULT_POOL_FACTORS,
         help="Pool factors to evaluate in order.",
+    )
+    parser.add_argument(
+        "--pool-methods",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional pooling methods to sweep (space/comma separated). "
+            "Available: hier, kmeans, slice (aliases: hierarchical, span)."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -329,6 +383,7 @@ def main() -> None:
         selected_datasets = dataset_names
     else:
         selected_datasets = ALL_NANOBEIR_DATASETS
+    selected_methods = _parse_selected_methods(args.pool_methods)
 
     this_file = Path(__file__).resolve()
     eval_script = this_file.with_name("run_nanobeir_evaluation.py")
@@ -342,6 +397,10 @@ def main() -> None:
     print(f"Using GPU device: {args.device}")
     print("Datasets: " + ("all" if dataset_names is None else ", ".join(selected_datasets)))
     print(
+        "Pool methods: "
+        + ", ".join(method_name for method_name, _ in selected_methods)
+    )
+    print(
         "Run config: "
         f"batch_size={args.batch_size}, query_length={args.query_length}, "
         f"document_length={args.document_length}"
@@ -352,7 +411,7 @@ def main() -> None:
     combinations = [
         (pool_factor, method_idx, method_name, method_cli)
         for pool_factor in args.pool_factors
-        for method_idx, (method_name, method_cli) in enumerate(METHODS)
+        for method_idx, (method_name, method_cli) in enumerate(selected_methods)
     ]
 
     run_records = []
@@ -413,7 +472,7 @@ def main() -> None:
             output_dir=output_dir,
             file_pattern=f"nanobeir_{safe_name(value=args.model)}_pool*_*.json",
             model_name=args.model,
-            methods=METHODS,
+            methods=selected_methods,
             filters={
                 "dataset_names": selected_datasets,
                 "query_length": args.query_length,
@@ -487,6 +546,7 @@ def main() -> None:
         rows=rows,
         per_dataset_rows=per_dataset_rows,
         pool_factors=sorted({int(record["pool_factor"]) for record in run_records}),
+        methods=selected_methods,
     )
 
 

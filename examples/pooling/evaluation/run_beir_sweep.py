@@ -81,6 +81,49 @@ METHODS = [
 METRICS = ["ndcg@10", "mrr@10", "map@100", "recall@10", "recall@100"]
 
 
+def _parse_selected_methods(method_values: list[str] | None) -> list[tuple[str, str]]:
+    if method_values is None:
+        return METHODS.copy()
+
+    requested_methods = normalize_cli_list(
+        method_values, lowercase=True, unique=False
+    )
+    if requested_methods is None:
+        return METHODS.copy()
+
+    alias_to_cli = {
+        "hier": "hierarchical",
+        "hierarchical": "hierarchical",
+        "kmeans": "kmeans",
+        "slice": "span",
+        "span": "span",
+    }
+    method_names = {method_cli: method_name for method_name, method_cli in METHODS}
+
+    selected_methods: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    invalid_methods: list[str] = []
+    for requested_method in requested_methods:
+        method_cli = alias_to_cli.get(requested_method)
+        if method_cli is None:
+            invalid_methods.append(requested_method)
+            continue
+        if method_cli in seen:
+            continue
+        seen.add(method_cli)
+        selected_methods.append((method_names[method_cli], method_cli))
+
+    if invalid_methods:
+        raise ValueError(
+            f"Unknown pooling methods: {sorted(set(invalid_methods))}. "
+            "Available: hier, kmeans, slice (aliases: hierarchical, span)."
+        )
+    if not selected_methods:
+        raise ValueError("No pooling methods selected.")
+
+    return selected_methods
+
+
 def _run_config_suffix(k: int, document_length: int) -> str:
     if k == DEFAULT_TOP_K and document_length == DEFAULT_DOCUMENT_LENGTH:
         return ""
@@ -175,6 +218,7 @@ def _write_overview_artifacts(
     rows: list[dict],
     pool_factors: list[int],
     selected_datasets: list[str],
+    methods: list[tuple[str, str]],
 ) -> None:
     df = pd.DataFrame(rows)
     df = df.sort_values(["dataset_name", "pool_factor", "method_order"]).reset_index(
@@ -196,7 +240,7 @@ def _write_overview_artifacts(
 
     ndcg_pivot = (
         agg_df.pivot(index="pool_factor", columns="pool_method", values="mean_ndcg@10")
-        .reindex(index=pool_factors, columns=[method_name for method_name, _ in METHODS])
+        .reindex(index=pool_factors, columns=[method_name for method_name, _ in methods])
         .reset_index()
     )
     ndcg_table_md_path = output_dir / "overview_mean_ndcg_at_10_table.md"
@@ -205,7 +249,7 @@ def _write_overview_artifacts(
         f.write("\n")
 
     plt.figure(figsize=(10, 6))
-    for method_name, _ in METHODS:
+    for method_name, _ in methods:
         method_df = agg_df[agg_df["pool_method"] == method_name].sort_values(
             "pool_factor"
         )
@@ -270,6 +314,16 @@ def main() -> None:
         nargs="+",
         default=DEFAULT_POOL_FACTORS,
         help="Pool factors to evaluate in order.",
+    )
+    parser.add_argument(
+        "--pool-methods",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional pooling methods to sweep (space/comma separated). "
+            "Available: hier, kmeans, slice (aliases: hierarchical, span)."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -351,6 +405,7 @@ def main() -> None:
         selected_datasets = dataset_names
     else:
         selected_datasets = ALL_BEIR_DATASETS
+    selected_methods = _parse_selected_methods(args.pool_methods)
 
     this_file = Path(__file__).resolve()
     eval_script = this_file.with_name("run_beir_evaluation.py")
@@ -363,6 +418,10 @@ def main() -> None:
 
     print(f"Using device: {args.device}")
     print("Datasets: " + ("all" if dataset_names is None else ", ".join(selected_datasets)))
+    print(
+        "Pool methods: "
+        + ", ".join(method_name for method_name, _ in selected_methods)
+    )
     print(f"Sweep output directory: {output_dir}")
     print(f"Evaluation script: {eval_script}")
 
@@ -370,7 +429,7 @@ def main() -> None:
         (dataset_name, pool_factor, method_idx, method_name, method_cli)
         for dataset_name in selected_datasets
         for pool_factor in args.pool_factors
-        for method_idx, (method_name, method_cli) in enumerate(METHODS)
+        for method_idx, (method_name, method_cli) in enumerate(selected_methods)
     ]
 
     run_records = []
@@ -434,7 +493,7 @@ def main() -> None:
             output_dir=output_dir,
             file_pattern=f"beir_{safe_name(value=args.model)}_pool*_*.json",
             model_name=args.model,
-            methods=METHODS,
+            methods=selected_methods,
             filters={
                 "k": args.k,
                 "document_length": args.document_length,
@@ -516,6 +575,7 @@ def main() -> None:
         rows=rows,
         pool_factors=sorted({int(record["pool_factor"]) for record in run_records}),
         selected_datasets=selected_datasets,
+        methods=selected_methods,
     )
 
 

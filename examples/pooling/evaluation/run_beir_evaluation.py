@@ -326,7 +326,7 @@ def main() -> None:
             index_folder=str(index_folder),
             index_name=(
                 f"{dataset_name.replace('/', '_')}_{safe_name}_"
-                f"pool{args.pool_factor}_{args.pool_method}"
+                f"{args.pool_method}"
             ),
             override=True,
             device=device,
