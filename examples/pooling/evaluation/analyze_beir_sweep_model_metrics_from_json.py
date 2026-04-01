@@ -27,7 +27,7 @@ from eval_shared import normalize_cli_list
 DEFAULT_METRICS = ["ndcg@10", "mrr@10", "map@100", "recall@10", "recall@100"]
 DEFAULT_POOL_FACTORS = [1, 2, 3, 4, 5, 6]
 DEFAULT_OUTPUT_PATH = Path(
-    "examples/pooling/evaluation/results/beir_combined_model_metrics_v4.csv"
+    "examples/pooling/evaluation/results/beir_combined_model_metrics.csv"
 )
 DEFAULT_RESULT_SOURCES = [
     Path(
