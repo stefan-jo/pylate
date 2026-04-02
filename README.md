@@ -3,7 +3,7 @@
   <p>Flexible Training and Retrieval for Late Interaction Models</p>
 </div>
 
-> **Fork note:** This fork accompanies the paper _Learn to Pool: Lightweight Fine-Tuning for Flexible Multi-Vector Compression_ and contains the project code, experiments, and artifacts for pooling-aware ColBERT fine-tuning.
+> **Fork note:** This fork accompanies the paper _Learn to Pool: Lightweight Fine-Tuning for Flexible Multi-Vector Compression_ and contains the training and evaluation code for pooling-aware ColBERT fine-tuning.
 > Start here: [`examples/pooling/README.md`](examples/pooling/README.md) | [Paper](https://stefan-jo.github.io/learn-to-pool/downloads/paper.pdf)
 
 <p align="center"><img width=500 src="https://raw.githubusercontent.com/lightonai/pylate/refs/heads/main/docs/img/logo.png"/></p>

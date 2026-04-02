@@ -1,6 +1,6 @@
 # Learn to Pool
 
-This directory contains the code and artifacts for the paper _Learn to Pool: Lightweight Fine-Tuning for Flexible Multi-Vector Compression_.
+This directory contains the training and evaluation code for the paper _Learn to Pool: Lightweight Fine-Tuning for Flexible Multi-Vector Compression_.
 
 The project studies whether lightweight pooling-aware fine-tuning can improve ColBERT document compression compared to inference-only pooling. It evaluates three document-side pooling methods, sequential (span), hierarchical, and k-means, across pool factors 2-6 on top of `mxbai-edge-colbert-v0-32m`.
 
@@ -43,26 +43,26 @@ Only the best-performing models were uploaded to Hugging Face. The uploaded data
 
 ## Repository Contents
 
-- `train/`: training scripts, data preparation code, and supporting notebooks
-- `evaluation/`: evaluation scripts, sweep outputs, and analysis notebooks
+- `train/`: training and data preparation scripts
+- `evaluation/`: evaluation scripts
 
 ### Data Preparation
 
-- `train/data/mine_beir_training_data.py`: builds BEIR training tuples with positives, hard negatives, and random negatives
-- `train/data/score_beir_training_data.py`: reranks mined tuples and produces the final scored training splits used for distillation
+- `train/data/mine_beir_training_data.py`: mines hard negative candidates for BEIR training splits
+- `train/data/score_beir_training_data.py`: assigns reranker scores for distillation and selects 16-way training tuples
 
 ### Training
 
-- `train/train_beir_colbert_distillation.py`: main script for pooling-aware ColBERT distillation on a scored BEIR training split
+- `train/train_beir_colbert_distillation.py`: main training script for pooling-aware ColBERT distillation 
 
 ### Evaluation
 
-- `evaluation/run_nanobeir_sweep.py`: runs NanoBEIR pooling sweeps and aggregates retrieval metrics
-- `evaluation/run_beir_sweep.py`: runs BEIR pooling sweeps and writes summary tables, plots, and JSON outputs
+- `evaluation/run_nanobeir_sweep.py`: runs NanoBEIR pooling sweeps and saves results
+- `evaluation/run_beir_sweep.py`: runs BEIR pooling sweeps and saves results
 
 ## Results
 
-These CSV files contain the main aggregate evaluation outputs used for model comparison.
+These CSV files contain the main aggregate evaluation outputs used for model comparison in the paper.
 
 - `evaluation/results/combined_model_metrics.csv`: aggregated NanoBEIR model metrics
 - `evaluation/results/beir_combined_model_metrics.csv`: aggregated BEIR model metrics
